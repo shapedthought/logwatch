@@ -1,0 +1,52 @@
+# LogWatch Configuration File
+# This is an example configuration showing all available options
+
+[watch]
+# Directories to watch recursively for log files.
+# Note: `~` is not expanded - use an absolute or relative path.
+directories = [
+    "/var/log",
+    "./logs"
+]
+
+# File pattern to match (supports glob patterns)
+# Default: "*.log"
+file_pattern = "*.log"
+
+[display]
+# Path display style: "full", "relative", or "filename"
+# - full: Show absolute paths (/var/log/app/error.log)
+# - relative: Show paths relative to watch root (app/error.log)
+# - filename: Show only filename (error.log)
+# Default: "relative"
+path_style = "relative"
+
+[filters]
+# Include patterns (regex) - if specified, only lines matching these patterns will be shown
+include = [
+    "ERROR",
+    "WARN",
+    "FATAL"
+]
+
+# Exclude patterns (regex) - lines matching these patterns will be filtered out
+exclude = [
+    "DEBUG",
+    "health check"
+]
+
+[history]
+# Lines kept in memory for the interactive '/' search.
+# Every line seen is retained, including ones the filters above hid, so a
+# search can still surface something the filter dropped. 0 disables history.
+# Default: 10000
+limit = 10000
+
+[output]
+# Mirror displayed lines to a file, in plain text with no color codes.
+# Equivalent to `-o/--output` on the command line.
+# file = "logwatch.out"
+
+# Append to the file instead of overwriting it on startup.
+# Default: false
+append = false

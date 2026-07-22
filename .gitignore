@@ -1,0 +1,21 @@
+# Rust
+# Note: Cargo.lock is intentionally committed - this is a binary crate,
+# so a locked dependency set keeps CI and release builds reproducible.
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test logs
+test_logs/
+*.log

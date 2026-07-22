@@ -1,0 +1,33 @@
+[package]
+name = "logwatch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A fast, real-time log file monitoring tool: watch directories recursively, filter with regex, and see everything in one unified stream"
+authors = ["Edward Howard <shapedthought@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/shapedthought/logwatch"
+homepage = "https://github.com/shapedthought/logwatch"
+keywords = ["log", "tail", "monitoring", "cli", "logs"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+exclude = ["generate_test_logs.sh", ".github/"]
+
+[dependencies]
+notify = "6.1"
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.10"
+# `use-dev-tty` swaps crossterm's mio/kqueue event source for a poll(2)-based
+# one. On macOS, kqueue cannot register /dev/tty (EINVAL), which otherwise
+# breaks the interactive keys whenever stdin is a pipe - i.e. `--stdin` mode.
+crossterm = { version = "0.27", features = ["use-dev-tty"] }
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+glob = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
