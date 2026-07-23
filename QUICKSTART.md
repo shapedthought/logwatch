@@ -143,6 +143,23 @@ History keeps every line seen - even ones your `-i`/`-e` filters hid - so you
 can go looking for something you filtered out without restarting. Use
 `--history NUM` to change how much is retained, or `--history 0` to turn it off.
 
+## Tracking Activity Over Time
+
+Press **`s`** for a histogram of log volume over time, broken down by severity
+and file — handy for spotting when a burst of errors lined up with a deploy or
+a job run:
+
+```bash
+# Write a CSV report when you quit (open it in a spreadsheet)
+cargo run -- -d ./logs --stats-out activity.csv
+
+# 5-minute buckets, exported as JSON
+cargo run -- -d ./logs --stats-interval 300 --stats-out activity.json
+```
+
+Buckets are keyed by when logwatch sees each line, and every line counts (even
+ones your filters hid), so the histogram shows true activity.
+
 ## Interactive Controls
 
 While running:
@@ -150,6 +167,7 @@ While running:
 - Press **`c`** to clear the screen
 - Press **`p`** to pause/resume (lines are buffered while paused, not dropped)
 - Press **`/`** to search the history, **`Esc`** to cancel
+- Press **`s`** to show the activity-stats histogram
 
 ## Installing Globally
 

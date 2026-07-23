@@ -16,6 +16,7 @@ A fast, real-time log file monitoring tool written in Rust. Watch multiple direc
 - ⚙️ **Flexible configuration** - Use CLI args, config files, or both
 - 🖥️ **Interactive TUI** - Pause, resume, and clear output on the fly
 - 🔎 **Searchable history** - Press `/` to search back over everything seen, including lines your filters hid
+- 📊 **Activity stats** - Press `s` for a timeline histogram of log volume by severity and file; export to CSV/JSON
 - 💾 **Export to file** - Mirror the displayed stream to a plain-text file with `-o`
 - 📍 **Smart path display** - Show full, relative, or just filename paths
 
@@ -124,6 +125,16 @@ logwatch -d ./logs -i "ERROR" -o errors.log
 logwatch -d ./logs -i "ERROR" -o errors.log --append
 ```
 
+### Track activity over time
+
+```bash
+# Press 's' while running for a histogram; write a report on exit
+logwatch -d ./logs --stats-out activity.csv
+
+# Use 5-minute buckets and export JSON instead
+logwatch -d ./logs --stats-interval 300 --stats-out activity.json
+```
+
 ### Read from stdin (for remote log streaming)
 
 ```bash
@@ -172,6 +183,10 @@ limit = 10000
 [output]
 file = "logwatch.out"
 append = false
+
+[stats]
+interval = 60          # time-bucket size in seconds
+out = "activity.csv"   # report written at exit (.json for JSON, else CSV)
 ```
 
 Then use it:
@@ -201,6 +216,8 @@ Options:
   -o, --output <FILE>         Also write displayed lines to FILE (plain text, no color)
       --append                Append to the output file instead of overwriting it
       --history <NUM>         Lines to retain for '/' search [default: 10000]
+      --stats-interval <SECS> Time-bucket size for activity stats [default: 60]
+      --stats-out <FILE>      Write an activity-stats report at exit (.json = JSON, else CSV)
       --no-color              Disable colored output
   -h, --help                  Print help
   -V, --version               Print version
@@ -218,6 +235,7 @@ While logwatch is running:
 - **`c`** - Clear the screen
 - **`p`** - Pause/resume log output. While paused, incoming lines are buffered rather than dropped
 - **`/`** - Search the retained history (see below). `Enter` runs the search, `Esc` cancels
+- **`s`** - Show the activity-stats histogram (see below)
 
 Keys are read from the controlling terminal rather than stdin, so they keep
 working in `--stdin` mode while a pipe is feeding logs in.
@@ -250,6 +268,46 @@ last, so a broad pattern cannot flood the terminal.
 
 When an input stream ends (the remote `tail` died, the container stopped),
 LogWatch stays open so the history is still searchable; press `q` to exit.
+
+## Activity Stats
+
+LogWatch buckets log activity by time so you can see *when* things happened and
+correlate bursts with system operations. Press `s` for a live histogram:
+
+```
+── Activity ── 60s buckets ── 2026-03-14 10:12-10:18 ──
+   (▓ error/fatal  ▒ warn  ░ info/debug/other)
+10:12  ░░░                                 6
+10:14  ▒▒░░░░░░░░░░░                       42
+10:16  ▓▓▓▓▓▓▓▒▒▒░░░░░░░░░░░░░░░░░░░░░░░   198
+10:18  ▓▒░░░                              14
+Totals: 260 lines — error 61, warn 44, info 120, other 35
+By file:
+  app/server.log                       181  ████████████████████████
+  api/requests.log                      52  ███████
+  db/queries.log                        27  ███
+```
+
+- **`--stats-interval SECS`** sets the bucket size (default 60). Smaller buckets
+  give finer resolution; larger ones smooth out the timeline.
+- **`--stats-out FILE`** writes a full report when LogWatch exits. The format is
+  chosen by extension: `.json` for JSON, anything else for CSV.
+
+The CSV is tidy long-format — one row per time bucket, file, and severity — which
+drops straight into a spreadsheet or plotting tool:
+
+```csv
+bucket_start,file,level,count
+2026-03-14T10:16:00+00:00,app/server.log,error,54
+2026-03-14T10:16:00+00:00,app/server.log,warn,18
+2026-03-14T10:16:00+00:00,api/requests.log,info,42
+```
+
+A note on timing: buckets are keyed by **when LogWatch sees each line**, not by
+any timestamp embedded in the log itself. For live monitoring that's the same
+thing; it's not meant for reconstructing timelines from an old file after the
+fact. Stats count every line seen, including ones your filters hid, so the
+histogram reflects true activity rather than the filtered view.
 
 ## Examples
 

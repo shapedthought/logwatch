@@ -50,3 +50,13 @@ limit = 10000
 # Append to the file instead of overwriting it on startup.
 # Default: false
 append = false
+
+[stats]
+# Time-bucket size in seconds for the activity histogram ('s' key).
+# Smaller = finer resolution; larger = a smoother timeline.
+# Default: 60
+interval = 60
+
+# Write an activity-stats report to this file when logwatch exits.
+# Format is chosen by extension: ".json" for JSON, anything else for CSV.
+# out = "activity.csv"

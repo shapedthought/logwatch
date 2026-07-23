@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{DateTime, Local, TimeZone};
 use clap::Parser;
 use crossterm::{
     cursor::MoveTo,
@@ -10,12 +10,17 @@ use crossterm::{
 };
 use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use regex::Regex;
+use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, IsTerminal, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{channel, Receiver, RecvTimeoutError, Sender},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -30,8 +35,27 @@ const DEFAULT_HISTORY_LIMIT: usize = 10_000;
 /// the terminal with the entire history.
 const SEARCH_RESULT_LIMIT: usize = 100;
 
-const BANNER: &str = "LogWatch - 'q' quit, 'c' clear, 'p' pause/resume, '/' search history";
+const BANNER: &str = "LogWatch - 'q' quit  'c' clear  'p' pause  '/' search  's' stats";
 const RULE: &str = "─────────────────────────────────────────────────────────────────────";
+
+/// Default time-bucket size for activity stats, in seconds.
+const DEFAULT_STATS_INTERVAL_SECS: i64 = 60;
+
+/// Cap on retained stats buckets so a long-running monitor stays bounded. At
+/// the default 60s interval this is well over a day of history.
+const STATS_MAX_BUCKETS: usize = 2000;
+
+/// Most recent buckets drawn in the `s` histogram.
+const STATS_HISTOGRAM_ROWS: usize = 20;
+
+/// Character width of a full activity bar in the histogram.
+const STATS_BAR_WIDTH: usize = 32;
+
+/// Files listed in the histogram's "by file" summary.
+const STATS_TOP_FILES: usize = 10;
+
+/// Character width of a full bar in the "by file" summary.
+const STATS_FILE_BAR_WIDTH: usize = 24;
 
 #[derive(Parser, Debug)]
 #[command(name = "logwatch")]
@@ -99,6 +123,14 @@ struct Args {
     /// Lines to retain in memory for '/' search (0 disables history)
     #[arg(long, value_name = "NUM")]
     history: Option<usize>,
+
+    /// Time-bucket size in seconds for the activity stats ('s' key) [default: 60]
+    #[arg(long, value_name = "SECS")]
+    stats_interval: Option<i64>,
+
+    /// Write an activity-stats report to FILE at exit (.json for JSON, else CSV)
+    #[arg(long, value_name = "FILE")]
+    stats_out: Option<PathBuf>,
 
     /// Disable colored output
     #[arg(long)]
@@ -356,6 +388,8 @@ struct DisplayOptions {
     history_limit: usize,
     output: Option<PathBuf>,
     append: bool,
+    stats_interval: i64,
+    stats_out: Option<PathBuf>,
 }
 
 /// Severity parsed out of a log line. Retained alongside each history entry so
@@ -398,6 +432,391 @@ impl LogLevel {
             Self::Other => None,
         }
     }
+
+    /// Every variant, in a fixed order. Used to index the per-level count arrays
+    /// in the stats buckets.
+    const ALL: [LogLevel; 6] = [
+        Self::Fatal,
+        Self::Error,
+        Self::Warn,
+        Self::Info,
+        Self::Debug,
+        Self::Other,
+    ];
+
+    /// Number of variants; the width of a per-level count array.
+    const COUNT: usize = Self::ALL.len();
+
+    /// Position of this level in `ALL`, for array indexing.
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|&l| l == self).unwrap()
+    }
+
+    /// Lowercase label used in stats reports (CSV/JSON columns).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fatal => "fatal",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Counts for one time bucket, keyed by display path then by level. Stores
+/// counts only - never the lines - so a long-running monitor stays cheap.
+#[derive(Default)]
+struct StatsBucket {
+    by_file: HashMap<String, [u64; LogLevel::COUNT]>,
+}
+
+impl StatsBucket {
+    fn record(&mut self, level: LogLevel, file: &str) {
+        let counts = self
+            .by_file
+            .entry(file.to_string())
+            .or_insert([0; LogLevel::COUNT]);
+        counts[level.index()] += 1;
+    }
+
+    fn total(&self) -> u64 {
+        self.by_file.values().flat_map(|c| c.iter()).sum()
+    }
+
+    /// Per-level totals across every file in this bucket.
+    fn by_level(&self) -> [u64; LogLevel::COUNT] {
+        let mut out = [0u64; LogLevel::COUNT];
+        for counts in self.by_file.values() {
+            for (slot, c) in out.iter_mut().zip(counts) {
+                *slot += c;
+            }
+        }
+        out
+    }
+}
+
+/// Activity counters bucketed by arrival time. Feeds the `s` histogram and the
+/// `--stats-out` report. Bounded to `max_buckets` (oldest dropped first).
+struct Stats {
+    interval_secs: i64,
+    max_buckets: usize,
+    /// Keyed by bucket-start epoch seconds, ordered oldest-first.
+    buckets: BTreeMap<i64, StatsBucket>,
+}
+
+impl Stats {
+    fn new(interval_secs: i64, max_buckets: usize) -> Self {
+        Self {
+            interval_secs: interval_secs.max(1),
+            max_buckets: max_buckets.max(1),
+            buckets: BTreeMap::new(),
+        }
+    }
+
+    /// Floor a timestamp to the start of its bucket (epoch seconds).
+    fn bucket_key(&self, ts: DateTime<Local>) -> i64 {
+        ts.timestamp().div_euclid(self.interval_secs) * self.interval_secs
+    }
+
+    fn record(&mut self, ts: DateTime<Local>, level: LogLevel, file: &str) {
+        let key = self.bucket_key(ts);
+        self.buckets.entry(key).or_default().record(level, file);
+
+        // Bound memory: drop the oldest bucket(s) once over the cap.
+        while self.buckets.len() > self.max_buckets {
+            let Some(&oldest) = self.buckets.keys().next() else {
+                break;
+            };
+            self.buckets.remove(&oldest);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    fn total_lines(&self) -> u64 {
+        self.buckets.values().map(StatsBucket::total).sum()
+    }
+
+    /// Per-level totals across all retained buckets.
+    fn level_totals(&self) -> [u64; LogLevel::COUNT] {
+        let mut out = [0u64; LogLevel::COUNT];
+        for bucket in self.buckets.values() {
+            for (slot, c) in out.iter_mut().zip(bucket.by_level()) {
+                *slot += c;
+            }
+        }
+        out
+    }
+
+    /// Per-file totals across all retained buckets, highest first.
+    fn file_totals(&self) -> Vec<(String, u64)> {
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for bucket in self.buckets.values() {
+            for (file, counts) in &bucket.by_file {
+                *totals.entry(file.clone()).or_insert(0) += counts.iter().sum::<u64>();
+            }
+        }
+        let mut totals: Vec<_> = totals.into_iter().collect();
+        // Sort by count desc, then name asc for a stable, readable order.
+        totals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        totals
+    }
+
+    fn bucket_label(&self, key: i64) -> String {
+        match Local.timestamp_opt(key, 0).single() {
+            Some(t) => t.format("%H:%M").to_string(),
+            None => key.to_string(),
+        }
+    }
+
+    /// A severity-stacked bar for one bucket, scaled so `max_total` fills
+    /// `STATS_BAR_WIDTH`. Error/fatal render as `▓`, warn as `▒`, the rest `░`.
+    fn bar(&self, bucket: &StatsBucket, max_total: u64) -> String {
+        let total = bucket.total();
+        if total == 0 || max_total == 0 {
+            return String::new();
+        }
+        let width = ((total as f64 / max_total as f64) * STATS_BAR_WIDTH as f64).round() as usize;
+        if width == 0 {
+            return String::new();
+        }
+
+        let levels = bucket.by_level();
+        let err = levels[LogLevel::Fatal.index()] + levels[LogLevel::Error.index()];
+        let warn = levels[LogLevel::Warn.index()];
+
+        let err_len = ((err as f64 / total as f64) * width as f64).round() as usize;
+        let err_len = err_len.min(width);
+        let warn_len = ((warn as f64 / total as f64) * width as f64).round() as usize;
+        let warn_len = warn_len.min(width - err_len);
+        let other_len = width - err_len - warn_len;
+
+        format!(
+            "{}{}{}",
+            "▓".repeat(err_len),
+            "▒".repeat(warn_len),
+            "░".repeat(other_len),
+        )
+    }
+
+    /// The multi-line histogram shown when the user presses `s`.
+    fn render_report(&self) -> Vec<String> {
+        if self.is_empty() {
+            return vec!["-- no activity recorded yet --".to_string()];
+        }
+
+        let first = *self.buckets.keys().next().unwrap();
+        let last = *self.buckets.keys().next_back().unwrap();
+        let span = match (
+            Local.timestamp_opt(first, 0).single(),
+            Local.timestamp_opt(last, 0).single(),
+        ) {
+            (Some(s), Some(e)) => format!(
+                "{} {}-{}",
+                s.format("%Y-%m-%d"),
+                s.format("%H:%M"),
+                e.format("%H:%M")
+            ),
+            _ => String::new(),
+        };
+
+        let mut out = vec![
+            format!(
+                "── Activity ── {}s buckets ── {} ──",
+                self.interval_secs, span
+            ),
+            "   (▓ error/fatal  ▒ warn  ░ info/debug/other)".to_string(),
+        ];
+
+        // Most recent buckets, drawn oldest-to-newest.
+        let recent: Vec<(&i64, &StatsBucket)> = self
+            .buckets
+            .iter()
+            .rev()
+            .take(STATS_HISTOGRAM_ROWS)
+            .collect();
+        let max_total = recent.iter().map(|(_, b)| b.total()).max().unwrap_or(0);
+        for (key, bucket) in recent.into_iter().rev() {
+            out.push(format!(
+                "{}  {:<width$}  {}",
+                self.bucket_label(*key),
+                self.bar(bucket, max_total),
+                bucket.total(),
+                width = STATS_BAR_WIDTH,
+            ));
+        }
+
+        // Totals line, nonzero levels only.
+        let levels = self.level_totals();
+        let breakdown: Vec<String> = LogLevel::ALL
+            .iter()
+            .filter(|l| levels[l.index()] > 0)
+            .map(|l| format!("{} {}", l.label(), levels[l.index()]))
+            .collect();
+        let breakdown = if breakdown.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", breakdown.join(", "))
+        };
+        out.push(format!("Totals: {} lines{}", self.total_lines(), breakdown));
+
+        // By-file summary.
+        let files = self.file_totals();
+        if !files.is_empty() {
+            out.push("By file:".to_string());
+            let max_file = files.first().map(|(_, c)| *c).unwrap_or(0).max(1);
+            for (file, count) in files.iter().take(STATS_TOP_FILES) {
+                let len = ((*count as f64 / max_file as f64) * STATS_FILE_BAR_WIDTH as f64).round()
+                    as usize;
+                out.push(format!(
+                    "  {:<28} {:>8}  {}",
+                    truncate_end(file, 28),
+                    count,
+                    "█".repeat(len),
+                ));
+            }
+            if files.len() > STATS_TOP_FILES {
+                out.push(format!(
+                    "  … and {} more files",
+                    files.len() - STATS_TOP_FILES
+                ));
+            }
+        }
+
+        out
+    }
+
+    /// Serialize the report and write it to `path`; `.json` selects JSON,
+    /// anything else CSV.
+    fn write_report(&self, path: &Path) -> Result<()> {
+        let is_json = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        let body = if is_json {
+            self.to_json()?
+        } else {
+            self.to_csv()
+        };
+        std::fs::write(path, body)
+            .with_context(|| format!("Failed to write stats report: {}", path.display()))
+    }
+
+    /// Tidy long-format CSV: one row per (bucket, file, level) with a nonzero
+    /// count. Easy to pivot in a spreadsheet or plotting tool.
+    fn to_csv(&self) -> String {
+        let mut out = String::from("bucket_start,file,level,count\n");
+        for (key, bucket) in &self.buckets {
+            let start = Local
+                .timestamp_opt(*key, 0)
+                .single()
+                .map(|t| t.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
+                .unwrap_or_else(|| key.to_string());
+            // Stable ordering: file name, then level order.
+            let mut files: Vec<_> = bucket.by_file.iter().collect();
+            files.sort_by(|a, b| a.0.cmp(b.0));
+            for (file, counts) in files {
+                for level in LogLevel::ALL {
+                    let count = counts[level.index()];
+                    if count > 0 {
+                        out.push_str(&format!(
+                            "{},{},{},{}\n",
+                            csv_field(&start),
+                            csv_field(file),
+                            level.label(),
+                            count,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn to_json(&self) -> Result<String> {
+        let buckets: Vec<StatsBucketReport> = self
+            .buckets
+            .iter()
+            .map(|(key, bucket)| {
+                let start = Local
+                    .timestamp_opt(*key, 0)
+                    .single()
+                    .map(|t| t.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
+                    .unwrap_or_else(|| key.to_string());
+
+                let levels = bucket.by_level();
+                let by_level: BTreeMap<String, u64> = LogLevel::ALL
+                    .iter()
+                    .filter(|l| levels[l.index()] > 0)
+                    .map(|l| (l.label().to_string(), levels[l.index()]))
+                    .collect();
+
+                let mut by_file: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+                for (file, counts) in &bucket.by_file {
+                    let per_level: BTreeMap<String, u64> = LogLevel::ALL
+                        .iter()
+                        .filter(|l| counts[l.index()] > 0)
+                        .map(|l| (l.label().to_string(), counts[l.index()]))
+                        .collect();
+                    by_file.insert(file.clone(), per_level);
+                }
+
+                StatsBucketReport {
+                    start,
+                    total: bucket.total(),
+                    by_level,
+                    by_file,
+                }
+            })
+            .collect();
+
+        let report = StatsReport {
+            interval_seconds: self.interval_secs,
+            generated_at: Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+            total_lines: self.total_lines(),
+            buckets,
+        };
+        serde_json::to_string_pretty(&report).context("Failed to serialize stats to JSON")
+    }
+}
+
+#[derive(Serialize)]
+struct StatsReport {
+    interval_seconds: i64,
+    generated_at: String,
+    total_lines: u64,
+    buckets: Vec<StatsBucketReport>,
+}
+
+#[derive(Serialize)]
+struct StatsBucketReport {
+    start: String,
+    total: u64,
+    by_level: BTreeMap<String, u64>,
+    by_file: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+/// Quote a CSV field if it contains a comma, quote, or newline (RFC 4180).
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Trim a string to `max` characters, marking the cut with a leading `…` so the
+/// distinctive tail of a path stays visible.
+fn truncate_end(value: &str, max: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max {
+        return value.to_string();
+    }
+    let tail: String = chars[chars.len() - (max - 1)..].iter().collect();
+    format!("…{}", tail)
 }
 
 /// A retained line. Stores the fully rendered text so a search can match on the
@@ -667,6 +1086,16 @@ fn display_logs(
     let interactive = io::stdout().is_terminal() && enable_raw_mode().is_ok();
     output.raw_mode = interactive;
 
+    // Break out of the loop on Ctrl-C / SIGTERM so the exit-time stats report
+    // and buffered output flush cleanly. In interactive raw mode the kernel
+    // does not raise SIGINT (Ctrl-C arrives as a key event, handled in the
+    // loop); this handler mainly covers headless runs and `kill`.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        let _ = ctrlc::set_handler(move || shutdown.store(true, Ordering::SeqCst));
+    }
+
     if interactive {
         execute!(output.term, Clear(ClearType::All), MoveTo(0, 0))?;
         output.notice(BANNER)?;
@@ -693,6 +1122,7 @@ fn display_logs(
         &options,
         &mut output,
         interactive,
+        &shutdown,
     );
 
     if interactive {
@@ -709,8 +1139,10 @@ fn run_display_loop(
     options: &DisplayOptions,
     output: &mut Output,
     interactive: bool,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut history = History::new(options.history_limit);
+    let mut stats = Stats::new(options.stats_interval, STATS_MAX_BUCKETS);
     let mut paused = false;
     let mut stream_ended = false;
     let mut line_number: u64 = 0;
@@ -719,6 +1151,15 @@ fn run_display_loop(
     let mut previous_lines: VecDeque<(u64, String, LogLevel)> = VecDeque::new();
 
     loop {
+        // Ctrl-C / SIGTERM: leave the loop so stats and output flush on the way
+        // out instead of the process being torn down mid-write.
+        if shutdown.load(Ordering::SeqCst) {
+            if interactive {
+                output.notice("-- shutting down --")?;
+            }
+            break;
+        }
+
         if interactive && event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 // Windows reports both press and release; only act on press.
@@ -744,6 +1185,11 @@ fn run_display_loop(
                         (KeyCode::Char('/'), _) => {
                             if let Some(pattern) = prompt_for_search(output)? {
                                 run_search(output, &history, &pattern)?;
+                            }
+                        }
+                        (KeyCode::Char('s'), _) => {
+                            for line in stats.render_report() {
+                                output.notice(&line)?;
                             }
                         }
                         _ => {}
@@ -772,17 +1218,19 @@ fn run_display_loop(
             }) => {
                 line_number += 1;
 
+                let display_path = options.path_style.render(&path, watch_roots);
                 let rendered = format!(
                     "[{}] {}: {}",
                     timestamp.format("%Y-%m-%d %H:%M:%S"),
-                    options.path_style.render(&path, watch_roots),
+                    display_path,
                     line
                 );
                 let level = LogLevel::detect(&line);
 
-                // Retain every line, filtered out or not, so `/` search can
-                // still turn up what the active filter hid.
+                // Retain every line, filtered out or not, so `/` search and the
+                // activity stats reflect real volume, not the filtered view.
                 history.push(&rendered, level);
+                stats.record(timestamp, level, &display_path);
 
                 if filter.matches(&line) {
                     for (number, text, context_level) in previous_lines.iter() {
@@ -828,6 +1276,36 @@ fn run_display_loop(
                 stream_ended = true;
             }
         }
+    }
+
+    finalize_stats(&stats, options, output, interactive)?;
+    Ok(())
+}
+
+/// On exit, write the stats report if `--stats-out` was set and show a one-line
+/// session summary on an interactive terminal.
+fn finalize_stats(
+    stats: &Stats,
+    options: &DisplayOptions,
+    output: &mut Output,
+    interactive: bool,
+) -> Result<()> {
+    if let Some(path) = &options.stats_out {
+        stats.write_report(path)?;
+        output.notice(&format!(
+            "[INFO] wrote activity stats to: {}",
+            path.display()
+        ))?;
+    }
+
+    if interactive && !stats.is_empty() {
+        let files = stats.file_totals().len();
+        output.notice(&format!(
+            "-- session: {} lines in {} buckets across {} file(s) --",
+            stats.total_lines(),
+            stats.buckets.len(),
+            files,
+        ))?;
     }
 
     Ok(())
@@ -929,6 +1407,15 @@ fn main() -> Result<()> {
     let output_path = args.output.or_else(|| config.output.file.clone());
     let append = args.append || config.output.append;
 
+    let stats_interval = args
+        .stats_interval
+        .or(config.stats.interval)
+        .unwrap_or(DEFAULT_STATS_INTERVAL_SECS);
+    if stats_interval < 1 {
+        anyhow::bail!("--stats-interval must be at least 1 second (got {stats_interval})");
+    }
+    let stats_out = args.stats_out.or_else(|| config.stats.out.clone());
+
     let display_options = DisplayOptions {
         path_style,
         before_context,
@@ -937,6 +1424,8 @@ fn main() -> Result<()> {
         history_limit,
         output: output_path,
         append,
+        stats_interval,
+        stats_out,
     };
 
     // Handle stdin mode
@@ -1309,5 +1798,176 @@ mod tests {
         output.echo("plain message", LogLevel::Other).unwrap();
 
         assert_eq!(term.contents(), "plain message\n");
+    }
+
+    // --- stats ---------------------------------------------------------------
+
+    fn ts(hms: &str) -> DateTime<Local> {
+        // Parse "YYYY-MM-DD HH:MM:SS" as a local timestamp for deterministic
+        // bucketing in tests.
+        let naive = chrono::NaiveDateTime::parse_from_str(hms, "%Y-%m-%d %H:%M:%S")
+            .expect("valid datetime");
+        Local
+            .from_local_datetime(&naive)
+            .single()
+            .expect("unambiguous")
+    }
+
+    #[test]
+    fn stats_buckets_by_interval() {
+        let mut stats = Stats::new(60, STATS_MAX_BUCKETS);
+        // Two lines in the same minute, one in the next.
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+        stats.record(ts("2026-07-23 14:16:59"), LogLevel::Warn, "app.log");
+        stats.record(ts("2026-07-23 14:17:00"), LogLevel::Info, "app.log");
+
+        assert_eq!(stats.buckets.len(), 2);
+        assert_eq!(stats.total_lines(), 3);
+    }
+
+    #[test]
+    fn stats_interval_changes_bucket_granularity() {
+        let mut stats = Stats::new(300, STATS_MAX_BUCKETS); // 5-minute buckets
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+        stats.record(ts("2026-07-23 14:17:00"), LogLevel::Info, "app.log");
+        // Both fall in the same 5-minute window.
+        assert_eq!(stats.buckets.len(), 1);
+    }
+
+    #[test]
+    fn stats_track_levels_and_files_jointly() {
+        let mut stats = Stats::new(60, STATS_MAX_BUCKETS);
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+        stats.record(ts("2026-07-23 14:16:06"), LogLevel::Error, "app.log");
+        stats.record(ts("2026-07-23 14:16:07"), LogLevel::Warn, "db.log");
+
+        let levels = stats.level_totals();
+        assert_eq!(levels[LogLevel::Error.index()], 2);
+        assert_eq!(levels[LogLevel::Warn.index()], 1);
+
+        let files = stats.file_totals();
+        // Highest-volume file first.
+        assert_eq!(files[0], ("app.log".to_string(), 2));
+        assert_eq!(files[1], ("db.log".to_string(), 1));
+    }
+
+    #[test]
+    fn stats_evict_oldest_bucket_past_the_cap() {
+        let mut stats = Stats::new(60, 2);
+        stats.record(ts("2026-07-23 14:16:00"), LogLevel::Info, "a.log");
+        stats.record(ts("2026-07-23 14:17:00"), LogLevel::Info, "a.log");
+        stats.record(ts("2026-07-23 14:18:00"), LogLevel::Info, "a.log");
+
+        assert_eq!(stats.buckets.len(), 2);
+        // The 14:16 bucket was dropped; the two most recent survive.
+        let first = *stats.buckets.keys().next().unwrap();
+        assert_eq!(
+            Local
+                .timestamp_opt(first, 0)
+                .single()
+                .unwrap()
+                .format("%H:%M")
+                .to_string(),
+            "14:17"
+        );
+    }
+
+    #[test]
+    fn stats_fatal_and_error_share_the_error_bar_segment() {
+        let mut bucket = StatsBucket::default();
+        bucket.record(LogLevel::Fatal, "a.log");
+        bucket.record(LogLevel::Error, "a.log");
+        let stats = Stats::new(60, STATS_MAX_BUCKETS);
+        // Whole bucket is error/fatal, so the bar is all '▓', no other shades.
+        let bar = stats.bar(&bucket, 2);
+        assert!(bar.chars().all(|c| c == '▓'), "bar was {bar:?}");
+    }
+
+    #[test]
+    fn stats_csv_is_tidy_long_format() {
+        let mut stats = Stats::new(60, STATS_MAX_BUCKETS);
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+        stats.record(ts("2026-07-23 14:16:06"), LogLevel::Warn, "app.log");
+
+        let csv = stats.to_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "bucket_start,file,level,count");
+        // One row per (bucket, file, level) with a nonzero count.
+        assert!(lines.iter().any(|l| l.contains("app.log,error,1")));
+        assert!(lines.iter().any(|l| l.contains("app.log,warn,1")));
+        // Zero-count levels are omitted.
+        assert!(!lines.iter().any(|l| l.contains(",info,")));
+    }
+
+    #[test]
+    fn stats_csv_quotes_fields_with_commas() {
+        let mut stats = Stats::new(60, STATS_MAX_BUCKETS);
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Info, "weird,name.log");
+        let csv = stats.to_csv();
+        assert!(csv.contains("\"weird,name.log\""), "csv was:\n{csv}");
+    }
+
+    #[test]
+    fn stats_json_round_trips_to_expected_shape() {
+        let mut stats = Stats::new(120, STATS_MAX_BUCKETS);
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+
+        let json: serde_json::Value = serde_json::from_str(&stats.to_json().unwrap()).unwrap();
+        assert_eq!(json["interval_seconds"], 120);
+        assert_eq!(json["total_lines"], 1);
+        let bucket = &json["buckets"][0];
+        assert_eq!(bucket["total"], 1);
+        assert_eq!(bucket["by_level"]["error"], 1);
+        assert_eq!(bucket["by_file"]["app.log"]["error"], 1);
+    }
+
+    #[test]
+    fn stats_report_by_extension_writes_json_or_csv() {
+        let dir = temp_dir("stats");
+        let mut stats = Stats::new(60, STATS_MAX_BUCKETS);
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+
+        let json_path = dir.join("report.json");
+        stats.write_report(&json_path).unwrap();
+        assert!(std::fs::read_to_string(&json_path)
+            .unwrap()
+            .contains("\"interval_seconds\""));
+
+        let csv_path = dir.join("report.csv");
+        stats.write_report(&csv_path).unwrap();
+        assert!(std::fs::read_to_string(&csv_path)
+            .unwrap()
+            .starts_with("bucket_start,file,level,count"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stats_render_report_is_empty_message_when_no_activity() {
+        let stats = Stats::new(60, STATS_MAX_BUCKETS);
+        assert_eq!(
+            stats.render_report(),
+            vec!["-- no activity recorded yet --".to_string()]
+        );
+    }
+
+    #[test]
+    fn stats_render_report_includes_histogram_and_summary() {
+        let mut stats = Stats::new(60, STATS_MAX_BUCKETS);
+        stats.record(ts("2026-07-23 14:16:05"), LogLevel::Error, "app.log");
+        stats.record(ts("2026-07-23 14:16:06"), LogLevel::Warn, "db.log");
+
+        let report = stats.render_report().join("\n");
+        assert!(report.contains("Activity"));
+        assert!(report.contains("14:16"));
+        assert!(report.contains("Totals: 2 lines"));
+        assert!(report.contains("By file:"));
+        assert!(report.contains("app.log"));
+    }
+
+    #[test]
+    fn truncate_end_keeps_the_tail() {
+        assert_eq!(truncate_end("short", 10), "short");
+        assert_eq!(truncate_end("averylongfilename.log", 8), "…ame.log");
     }
 }

@@ -21,6 +21,9 @@ pub struct Config {
 
     #[serde(default)]
     pub output: OutputConfig,
+
+    #[serde(default)]
+    pub stats: StatsConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +66,17 @@ pub struct OutputConfig {
 
     #[serde(default)]
     pub append: bool,
+}
+
+/// Activity-stats collection. `interval` is the time-bucket size in seconds;
+/// `out` is an optional report file written at exit (`.json` for JSON, else CSV).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct StatsConfig {
+    #[serde(default)]
+    pub interval: Option<i64>,
+
+    #[serde(default)]
+    pub out: Option<PathBuf>,
 }
 
 fn default_file_pattern() -> String {

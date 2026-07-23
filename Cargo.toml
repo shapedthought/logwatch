@@ -23,9 +23,13 @@ regex = "1.10"
 crossterm = { version = "0.27", features = ["use-dev-tty"] }
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 anyhow = "1.0"
 glob = "0.3"
+# Graceful shutdown on Ctrl-C / SIGTERM so the exit-time stats report and any
+# buffered -o output are flushed even in non-interactive (headless) runs.
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [profile.release]
 opt-level = 3
