@@ -1,6 +1,6 @@
 [package]
 name = "logwatch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.74"
 description = "A fast, real-time log file monitoring tool: watch directories recursively, filter with regex, and see everything in one unified stream"
