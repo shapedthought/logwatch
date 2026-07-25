@@ -2,6 +2,13 @@
 
 This guide shows you how to use logwatch's `--stdin` mode to stream and format logs from remote servers, containers, and other sources.
 
+> **Always pass `ssh -n` when piping into logwatch.** Without it, ssh keeps
+> reading your local keyboard and forwards it to the remote command, so your
+> interactive keys (`q`, `p`, `s`, `/`) get swallowed before logwatch sees them.
+> `-n` tells ssh not to read stdin, which is what you want when you're only
+> streaming output. This matters most on Windows, where the keys stop working
+> entirely without it. See [Troubleshooting](#interactive-keys-qps-dont-work-while-streaming).
+
 ## SSH Log Streaming
 
 ### Basic Remote Tailing
@@ -9,7 +16,7 @@ This guide shows you how to use logwatch's `--stdin` mode to stream and format l
 Stream logs from a remote server with nice formatting:
 
 ```bash
-ssh user@production-server "tail -f /var/log/app/*.log" | logwatch --stdin
+ssh -n user@production-server "tail -f /var/log/app/*.log" | logwatch --stdin
 ```
 
 ### With Filtering
@@ -17,7 +24,7 @@ ssh user@production-server "tail -f /var/log/app/*.log" | logwatch --stdin
 Only show errors and warnings from remote server:
 
 ```bash
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN"
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN"
 ```
 
 ### Multiple Log Files
@@ -25,7 +32,7 @@ ssh user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN"
 Tail multiple remote logs and combine them:
 
 ```bash
-ssh user@server "tail -f /var/log/nginx/access.log /var/log/app/*.log" | logwatch --stdin
+ssh -n user@server "tail -f /var/log/nginx/access.log /var/log/app/*.log" | logwatch --stdin
 ```
 
 ### Recursive Directory Streaming (All .log Files)
@@ -33,7 +40,7 @@ ssh user@server "tail -f /var/log/nginx/access.log /var/log/app/*.log" | logwatc
 `tail -f` is not recursive by itself. Use `find` + `xargs` + `tail -F` to stream all log files under a directory tree:
 
 ```bash
-ssh user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
+ssh -n user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
 ```
 
 This approach:
@@ -47,7 +54,7 @@ This approach:
 Show the full file paths in the output:
 
 ```bash
-ssh user@server "tail -f /var/log/app/*.log" | logwatch --stdin --full-paths
+ssh -n user@server "tail -f /var/log/app/*.log" | logwatch --stdin --full-paths
 ```
 
 ## Docker Container Logs
@@ -118,16 +125,16 @@ Use SSH multiplexing to monitor multiple servers:
 
 ```bash
 # Terminal 1
-ssh server1 "tail -f /var/log/*.log" | logwatch --stdin &
+ssh -n server1 "tail -f /var/log/*.log" | logwatch --stdin &
 
 # Terminal 2  
-ssh server2 "tail -f /var/log/*.log" | logwatch --stdin
+ssh -n server2 "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 Or combine them:
 
 ```bash
-(ssh server1 "tail -f /var/log/*.log"; ssh server2 "tail -f /var/log/*.log") | logwatch --stdin
+(ssh -n server1 "tail -f /var/log/*.log"; ssh -n server2 "tail -f /var/log/*.log") | logwatch --stdin
 ```
 
 ### Remote + Local Logs
@@ -139,7 +146,7 @@ Run two instances to watch both:
 logwatch -d ./logs
 
 # Terminal 2: Remote logs
-ssh server "tail -f /var/log/*.log" | logwatch --stdin
+ssh -n server "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 ### Persistent SSH Connection
@@ -156,7 +163,7 @@ Host production
     ControlPersist 10m
 
 # Then use it
-ssh production "tail -f /var/log/*.log" | logwatch --stdin
+ssh -n production "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 ## Understanding Stdin Input Format
@@ -218,13 +225,13 @@ echo 'yourpassword' > ~/.ssh_pass && chmod 600 ~/.ssh_pass
 ### Basic Usage
 
 ```bash
-sshpass -f ~/.ssh_pass ssh user@server "tail -f /var/log/*.log" | logwatch --stdin
+sshpass -f ~/.ssh_pass ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 ### Recursive Directory Streaming with sshpass
 
 ```bash
-sshpass -f ~/.ssh_pass ssh user@server \
+sshpass -f ~/.ssh_pass ssh -n user@server \
   "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" \
   | logwatch --stdin -P --no-color
 ```
@@ -234,7 +241,7 @@ sshpass -f ~/.ssh_pass ssh user@server \
 ### File Only (No Terminal Output)
 
 ```bash
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color > output.log 2>&1
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color > output.log 2>&1
 ```
 
 ### Live View and File Simultaneously
@@ -242,19 +249,19 @@ ssh user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color > output.
 Use `tee` to see the output in your terminal while also saving to a file:
 
 ```bash
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color | tee output.log
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color | tee output.log
 ```
 
 To append to an existing file instead of overwriting:
 
 ```bash
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color | tee -a output.log
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color | tee -a output.log
 ```
 
 ### Combining sshpass with tee
 
 ```bash
-sshpass -f ~/.ssh_pass ssh user@server \
+sshpass -f ~/.ssh_pass ssh -n user@server \
   "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" \
   | logwatch --stdin -P --no-color | tee raw_logs.txt
 ```
@@ -262,7 +269,7 @@ sshpass -f ~/.ssh_pass ssh user@server \
 ### Save Only Filtered Lines
 
 ```bash
-ssh user@server "tail -f /var/log/*.log" | \
+ssh -n user@server "tail -f /var/log/*.log" | \
   logwatch --stdin --no-color -i "ERROR|WARN" | \
   tee filtered.log
 ```
@@ -276,13 +283,13 @@ ssh user@server "tail -f /var/log/*.log" | \
 Add to your SSH command to keep connection alive:
 
 ```bash
-ssh -o ServerAliveInterval=60 user@server "tail -f /var/log/*.log" | logwatch --stdin
+ssh -n -o ServerAliveInterval=60 user@server "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 ### Run in Background
 
 ```bash
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color > output.log 2>&1 &
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin --no-color > output.log 2>&1 &
 ```
 
 ### Reconnect on Disconnect
@@ -291,7 +298,7 @@ Use a loop to auto-reconnect:
 
 ```bash
 while true; do
-  ssh user@server "tail -f /var/log/*.log" | logwatch --stdin
+  ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin
   echo "Connection lost, reconnecting in 5 seconds..."
   sleep 5
 done
@@ -302,7 +309,7 @@ done
 Some systems don't support `xargs -r`. Use this variant:
 
 ```bash
-ssh user@server "while true; do files=\$(find /var/log/app -type f -name '*.log'); [ -n \"\$files\" ] && tail -n0 -F \$files; sleep 1; done" | logwatch --stdin -P
+ssh -n user@server "while true; do files=\$(find /var/log/app -type f -name '*.log'); [ -n \"\$files\" ] && tail -n0 -F \$files; sleep 1; done" | logwatch --stdin -P
 ```
 
 ### Save Filtered Output
@@ -311,23 +318,47 @@ See [Saving Output to a File](#saving-output-to-a-file) for full details on savi
 
 ## Common Issues
 
+### Interactive keys (q/p/s) don't work while streaming
+
+By default `ssh` reads your local keyboard and forwards it to the remote
+command's stdin. When you pipe `ssh … | logwatch --stdin`, that means your
+keypresses go to the remote `tail` (which ignores them) instead of to logwatch,
+so `q`, `p`, `s`, and `/` appear dead.
+
+Fix: add **`-n`** so ssh stops reading stdin — you're only streaming output back,
+not sending anything to the remote:
+
+```bash
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin
+```
+
+Notes:
+- On **Windows** the keys stop working *entirely* without `-n` (the console
+  input is drained by ssh). On **macOS/Linux** logwatch reads the controlling
+  terminal directly, so it usually still gets the keys, but a stray first press
+  can be swallowed — `-n` makes it reliable everywhere.
+- With `sshpass`, put `-n` on the `ssh` part: `sshpass -f pass ssh -n user@server …`.
+- Make sure the `|` is *outside* the ssh quotes, so logwatch runs on your local
+  machine: `ssh -n host "tail -f …" | logwatch --stdin` — not
+  `ssh -n host "tail -f … | logwatch --stdin"`.
+
 ### "Connection refused"
 
 Make sure you can SSH to the server normally first:
 ```bash
-ssh user@server echo "test"
+ssh -n user@server echo "test"
 ```
 
 ### No Output Appearing
 
 Check that the remote command works directly:
 ```bash
-ssh user@server "tail -n 10 /var/log/*.log"
+ssh -n user@server "tail -n 10 /var/log/*.log"
 ```
 
 If you're using recursive streaming, verify discovery returns files:
 ```bash
-ssh user@server "find /var/log/app -type f -name '*.log' | head"
+ssh -n user@server "find /var/log/app -type f -name '*.log' | head"
 ```
 
 ### Filtering Not Working
@@ -341,7 +372,7 @@ echo "ERROR: test" | logwatch --stdin -i "ERROR"
 
 Add these options:
 ```bash
-ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 user@server "tail -f /var/log/*.log" | logwatch --stdin
+ssh -n -o ServerAliveInterval=30 -o ServerAliveCountMax=3 user@server "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 ### `xargs: tail: terminated by signal 13`
@@ -350,7 +381,7 @@ This is usually a broken pipe (`SIGPIPE`) when the downstream reader exits (for 
 
 Use stderr suppression on the remote `tail` if needed:
 ```bash
-ssh user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin
+ssh -n user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin
 ```
 
 ## Performance Considerations
@@ -360,7 +391,7 @@ ssh user@server "while true; do find /var/log/app -type f -name '*.log' -print0 
 - **SSH compression**: Add `-C` flag to SSH for compression if bandwidth is limited
 
 ```bash
-ssh -C user@server "tail -f /var/log/*.log" | logwatch --stdin
+ssh -n -C user@server "tail -f /var/log/*.log" | logwatch --stdin
 ```
 
 ## Security Notes
@@ -393,7 +424,7 @@ ssh -C user@server "tail -f /var/log/*.log" | logwatch --stdin
 
 ```bash
 # Stream production logs, filter for errors
-ssh prod "tail -f /var/log/app/*.log" | logwatch --stdin -i "ERROR|EXCEPTION"
+ssh -n prod "tail -f /var/log/app/*.log" | logwatch --stdin -i "ERROR|EXCEPTION"
 
 # Press 'p' to pause when you see the issue
 # Press 'c' to clear and continue monitoring
@@ -410,8 +441,8 @@ kubectl logs -f deployment/my-app | logwatch --stdin -e "health_check"
 
 ```bash
 # Terminal 1: Staging
-ssh staging "tail -f /var/log/app/*.log" | logwatch --stdin -i "ERROR"
+ssh -n staging "tail -f /var/log/app/*.log" | logwatch --stdin -i "ERROR"
 
 # Terminal 2: Production
-ssh prod "tail -f /var/log/app/*.log" | logwatch --stdin -i "ERROR"
+ssh -n prod "tail -f /var/log/app/*.log" | logwatch --stdin -i "ERROR"
 ```

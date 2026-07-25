@@ -76,21 +76,21 @@ cargo run -- -d ./logs --full-paths
 
 ### Stream remote logs over SSH (stdin mode)
 ```bash
-ssh user@server "tail -f /var/log/app/*.log" | cargo run -- --stdin
+ssh -n user@server "tail -f /var/log/app/*.log" | cargo run -- --stdin
 ```
 
 ### Recursively stream all remote .log files
 ```bash
-ssh user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | cargo run -- --stdin -P
+ssh -n user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | cargo run -- --stdin -P
 ```
 
 ### Copy/paste template for an application log tree
 ```bash
 # Local machine runs logwatch; remote server streams the log tree recursively
-ssh user@server "while true; do find /var/log/myapp -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
+ssh -n user@server "while true; do find /var/log/myapp -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
 
 # Same, with filtering and 3 lines of context
-ssh user@server "while true; do find /var/log/myapp -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P -i "ERROR|WARN|FAILED" -C 3
+ssh -n user@server "while true; do find /var/log/myapp -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P -i "ERROR|WARN|FAILED" -C 3
 ```
 
 Notes:

@@ -139,16 +139,16 @@ logwatch -d ./logs --stats-interval 300 --stats-out activity.json
 
 ```bash
 # Stream logs from remote server via SSH
-ssh user@server "tail -f /var/log/app/*.log" | logwatch --stdin
+ssh -n user@server "tail -f /var/log/app/*.log" | logwatch --stdin
 
 # Recursively stream all .log files (including newly created files)
-ssh user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
+ssh -n user@server "while true; do find /var/log/app -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
 
 # With filtering
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN"
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN"
 
 # With filtering + context
-ssh user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN" -C 3
+ssh -n user@server "tail -f /var/log/*.log" | logwatch --stdin -i "ERROR|WARN" -C 3
 
 # Stream from docker container
 docker logs -f container_name | logwatch --stdin
@@ -156,6 +156,12 @@ docker logs -f container_name | logwatch --stdin
 # Stream from journalctl
 journalctl -f | logwatch --stdin -i "error"
 ```
+
+> **Note the `ssh -n`.** Without `-n`, ssh forwards your local keystrokes to the
+> remote command, so logwatch's interactive keys (`q`/`p`/`s`/`/`) get swallowed
+> — most visibly on Windows, where they stop working entirely. `-n` stops ssh
+> reading stdin, which is what you want when only streaming output. See the
+> [remote streaming guide](REMOTE_STREAMING.md#interactive-keys-qps-dont-work-while-streaming).
 
 ## Configuration File
 
@@ -347,13 +353,13 @@ logwatch -d ./logs -i "ERROR" -C 5
 
 ```bash
 # Monitor remote server logs with nice formatting
-ssh production-server "tail -f /var/log/nginx/*.log" | logwatch --stdin
+ssh -n production-server "tail -f /var/log/nginx/*.log" | logwatch --stdin
 
 # Recursively follow all logs from a directory tree
-ssh production-server "while true; do find /var/log/nginx -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
+ssh -n production-server "while true; do find /var/log/nginx -type f -name '*.log' -print0 | xargs -0 -r tail -n0 -F 2>/dev/null; sleep 1; done" | logwatch --stdin -P
 
 # Multiple remote sources via SSH multiplexing
-ssh server1 "tail -f /app/logs/*.log" | logwatch --stdin -i "ERROR|CRITICAL"
+ssh -n server1 "tail -f /app/logs/*.log" | logwatch --stdin -i "ERROR|CRITICAL"
 
 # Docker container logs
 docker logs -f my-app | logwatch --stdin
