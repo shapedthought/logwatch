@@ -21,7 +21,11 @@
 
 In one terminal, generate test logs:
 ```bash
+# Linux / macOS
 ./generate_test_logs.sh
+
+# Windows (PowerShell)
+.\generate_test_logs.ps1
 ```
 
 In another terminal, run logwatch:
